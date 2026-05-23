@@ -1,0 +1,2 @@
+recursive-include crossmodal_search/ui/templates *.html
+recursive-include crossmodal_search/ui/static *.css *.js

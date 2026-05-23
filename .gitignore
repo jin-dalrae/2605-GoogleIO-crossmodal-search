@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+*.tfrecord-*
+*.bin
+crossmodal_search/data/*.parquet
+crossmodal_search/data/*.npy
+crossmodal_search/data/*.json
+crossmodal_search/data/composites/
+crossmodal_search/data/vectors.lance/

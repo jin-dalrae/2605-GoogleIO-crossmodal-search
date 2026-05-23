@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crossmodal Search</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <main class="search-shell">
+    <section class="search-band">
+      <form id="search-form" class="search-form" autocomplete="off">
+        <label class="visually-hidden" for="query">Search driving scenes</label>
+        <input id="query" name="q" type="search" value="left turn" placeholder="Search driving scenes">
+        <button type="submit" title="Search">Search</button>
+      </form>
+      <div id="status-line" class="status-line">
+        {% if status.ready %}
+          {{ status.row_count }} indexed frames
+        {% else %}
+          Index unavailable: {{ status.error }}
+        {% endif %}
+      </div>
+    </section>
+
+    <section id="results" class="results-grid" aria-live="polite"></section>
+  </main>
+
+  <script>
+    window.CAMERA_ORDER = {{ camera_order | tojson }};
+    window.INDEX_READY = {{ status.ready | tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='search.js') }}"></script>
+</body>
+</html>

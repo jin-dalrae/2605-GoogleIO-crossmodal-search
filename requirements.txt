@@ -1,0 +1,9 @@
+Flask
+google-crc32c
+numpy
+pandas
+Pillow
+protobuf
+pyarrow
+scikit-learn
+

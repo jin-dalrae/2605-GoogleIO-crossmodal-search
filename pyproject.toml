@@ -1,0 +1,21 @@
+[project]
+name = "crossmodal-search"
+version = "0.1.0"
+description = "Natural-language search MVP over local Waymo E2E camera shards."
+requires-python = ">=3.11"
+dependencies = [
+  "Flask",
+  "google-crc32c",
+  "numpy",
+  "pandas",
+  "Pillow",
+  "protobuf",
+  "pyarrow",
+  "scikit-learn",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["crossmodal_search*"]

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Frame Detail</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <main class="detail-shell" data-frame-name="{{ frame_name }}">
+    <header class="detail-topbar">
+      <a class="back-link" href="/">&lt; Back</a>
+      <div class="detail-title">
+        <strong id="frame-title">{{ frame_name }}</strong>
+        <span id="frame-subtitle"></span>
+      </div>
+    </header>
+
+    <section class="cockpit-layout">
+      <div id="cockpit-grid" class="cockpit-grid"></div>
+
+      <aside class="side-panel">
+        <div class="panel-section">
+          <div class="label">Intent</div>
+          <div id="intent" class="large-value">-</div>
+        </div>
+        <div class="panel-section">
+          <div class="label">Caption</div>
+          <p id="caption" class="caption-text"></p>
+        </div>
+        <div class="panel-section">
+          <div class="label">Tags</div>
+          <div id="tags" class="chips"></div>
+        </div>
+        <div class="panel-section metric-grid">
+          <div>
+            <div class="label">Speed</div>
+            <div id="speed" class="metric">-</div>
+          </div>
+          <div>
+            <div class="label">Yaw</div>
+            <div id="yaw" class="metric">-</div>
+          </div>
+          <div>
+            <div class="label">Light</div>
+            <div id="light" class="metric">-</div>
+          </div>
+          <div>
+            <div class="label">Frame</div>
+            <div id="frame-count" class="metric">-</div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="scrubber-bar">
+      <button id="prev-frame" type="button" title="Previous frame">&lt;</button>
+      <input id="frame-range" type="range" min="0" value="0">
+      <button id="next-frame" type="button" title="Next frame">&gt;</button>
+      <span id="scrubber-label"></span>
+    </section>
+  </main>
+
+  <div id="lightbox" class="lightbox" hidden>
+    <button id="close-lightbox" type="button" title="Close">x</button>
+    <img id="lightbox-image" alt="">
+  </div>
+
+  <script>
+    window.INITIAL_FRAME = {{ frame_name | tojson }};
+    window.COCKPIT_ORDER = {{ camera_order | tojson }};
+    window.INDEX_READY = {{ status.ready | tojson }};
+  </script>
+  <script src="{{ url_for('static', filename='detail.js') }}"></script>
+</body>
+</html>
+
