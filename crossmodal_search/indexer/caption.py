@@ -131,7 +131,108 @@ class LocalBlipCaptioner:
         return self.processor.decode(output[0], skip_special_tokens=True)
 
 
-def maybe_load_vlm(model: str, model_name: str) -> LocalBlipCaptioner | None:
+def _agent_tags(caption_data: dict[str, Any]) -> list[str]:
+    tags = []
+    for key in ("time_of_day", "weather", "road_type"):
+        value = caption_data.get(key)
+        if value and value != "unknown":
+            tags.append(str(value))
+    for agent in caption_data.get("agents", []) or []:
+        if isinstance(agent, str):
+            agent_type = agent
+            count = 1
+        else:
+            agent_type = agent.get("type")
+            count = int(agent.get("count", 0) or 0)
+        if agent_type and count > 0:
+            tags.append(str(agent_type))
+    tags.extend(str(item) for item in caption_data.get("notable", []) or [])
+    tags.extend(str(item) for item in caption_data.get("tags", []) or [])
+    return list(dict.fromkeys(tag.strip().lower().replace(" ", "_") for tag in tags if str(tag).strip()))
+
+
+def _normalize_time_of_day(value: Any) -> str:
+    text = str(value or "").lower()
+    if "night" in text:
+        return "night"
+    if "dusk" in text or "evening" in text or "late afternoon" in text or "sunset" in text:
+        return "dusk"
+    if "dawn" in text or "morning" in text or "sunrise" in text:
+        return "dawn"
+    if "day" in text or "afternoon" in text or "noon" in text:
+        return "day"
+    return "unknown"
+
+
+def _normalize_weather(value: Any) -> str:
+    text = str(value or "").lower()
+    if "rain" in text:
+        return "rain"
+    if "snow" in text:
+        return "snow"
+    if "fog" in text:
+        return "fog"
+    if "wet" in text:
+        return "wet_road"
+    if "clear" in text or "sun" in text:
+        return "clear"
+    return "unknown"
+
+
+def _normalize_road_type(value: Any, tags: list[str]) -> str:
+    text = " ".join([str(value or ""), *tags]).lower()
+    if "highway" in text or "freeway" in text:
+        return "highway"
+    if "intersection" in text:
+        return "intersection"
+    if "residential" in text:
+        return "residential"
+    if "parking" in text:
+        return "parking_lot"
+    if "urban" in text or "street" in text:
+        return "urban_street"
+    return "other" if text.strip() else "unknown"
+
+
+class ManagedVisionCaptioner:
+    def __init__(self, model_name: str | None = None) -> None:
+        from crossmodal_search.agents.managed import VisionCaptionAgent
+
+        self.agent = VisionCaptionAgent(model_name) if model_name else VisionCaptionAgent()
+
+    def caption(self, image: Image.Image, *, row: pd.Series) -> dict[str, Any]:
+        response = self.agent.caption(
+            image,
+            frame_context={
+                "frame_name": row.get("frame_name"),
+                "intent_name": row.get("intent_name"),
+                "past_speed_now": row.get("past_speed_now"),
+            },
+        )
+        tags = _agent_tags(response)
+        time_of_day = _normalize_time_of_day(response.get("time_of_day"))
+        weather = _normalize_weather(response.get("weather"))
+        road_type = _normalize_road_type(response.get("road_type"), tags)
+        tags = list(dict.fromkeys([*tags, time_of_day, weather, road_type]))
+        return {
+            "caption": response.get("caption", ""),
+            "tags": tags,
+            "time_of_day": time_of_day,
+            "weather": weather,
+            "road_type": road_type,
+            "traffic_lights_visible": response.get("traffic_lights_visible"),
+            "agents_json": json.dumps(response.get("agents", [])),
+            "notable": response.get("notable", []),
+            "caption_model": response.get("model", "managed-agent"),
+            "caption_status": "vlm",
+            "caption_provider": response.get("provider"),
+            "caption_agent": response.get("agent"),
+        }
+
+
+def maybe_load_vlm(model: str, model_name: str) -> LocalBlipCaptioner | ManagedVisionCaptioner | None:
+    if model == "managed":
+        return ManagedVisionCaptioner(model_name if model_name != "auto" else None)
     if model not in {"auto", "blip"}:
         return None
     try:
@@ -150,15 +251,31 @@ def caption_frames(
     model: str,
     model_name: str,
     limit: int | None = None,
+    existing: pd.DataFrame | None = None,
+    retry_failed: bool = False,
     progress_every: int = 25,
 ) -> pd.DataFrame:
     vlm = maybe_load_vlm(model, model_name)
     rows = []
     total = len(frames) if limit is None else min(limit, len(frames))
+    existing_by_frame = {}
+    if existing is not None and not existing.empty and "frame_name" in existing:
+        for _, existing_row in existing.iterrows():
+            existing_by_frame[str(existing_row["frame_name"])] = existing_row.to_dict()
 
     for position, (_, row) in enumerate(frames.iterrows()):
         if limit is not None and position >= limit:
             break
+
+        frame_name = str(row["frame_name"])
+        existing_row = existing_by_frame.get(frame_name)
+        if existing_row is not None:
+            status = str(existing_row.get("caption_status", ""))
+            if status == "vlm" or (status.startswith("vlm_error:") and not retry_failed):
+                rows.append(existing_row)
+                if progress_every and (position + 1) % progress_every == 0:
+                    print(f"kept {position + 1}/{total} frames", file=sys.stderr)
+                continue
 
         record = load_record_by_offset(
             shard_path,
@@ -172,18 +289,20 @@ def caption_frames(
 
         if vlm is not None:
             try:
-                vlm_caption = vlm.caption(mosaic)
-                if vlm_caption:
-                    caption_data["caption"] = vlm_caption
-                    caption_data["caption_model"] = model_name
-                    caption_data["caption_status"] = "vlm"
+                if isinstance(vlm, ManagedVisionCaptioner):
+                    caption_data.update(vlm.caption(mosaic, row=row))
+                else:
+                    vlm_caption = vlm.caption(mosaic)
+                    if vlm_caption:
+                        caption_data["caption"] = vlm_caption
+                        caption_data["caption_model"] = model_name
+                        caption_data["caption_status"] = "vlm"
             except Exception as exc:
                 caption_data["caption_status"] = f"vlm_error:{exc.__class__.__name__}"
 
         composite_path = ""
         if save_composites:
             out_composite_dir.mkdir(parents=True, exist_ok=True)
-            frame_name = str(row["frame_name"])
             composite_file = out_composite_dir / f"{frame_name}.jpg"
             mosaic.save(composite_file, quality=88)
             composite_path = str(composite_file)
@@ -207,15 +326,17 @@ def caption_frames(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Caption scanned E2E frames with a local VLM or deterministic fallback.")
+    parser = argparse.ArgumentParser(description="Caption scanned E2E frames with a managed/local VLM or fallback.")
     parser.add_argument("--frames", type=Path, default=DEFAULT_IN, help="Input frames.parquet path.")
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="Output frames_tagged.parquet path.")
     parser.add_argument("--shard", type=Path, default=DEFAULT_SHARD_PATH, help="Local E2E TFRecord shard path.")
-    parser.add_argument("--model", choices=["auto", "heuristic", "blip"], default="auto")
-    parser.add_argument("--model-name", default="Salesforce/blip-image-captioning-base")
+    parser.add_argument("--model", choices=["auto", "heuristic", "blip", "managed"], default="auto")
+    parser.add_argument("--model-name", default="auto")
     parser.add_argument("--save-composites", action="store_true", help="Write cached 4x2 composite JPEGs.")
     parser.add_argument("--composite-dir", type=Path, default=DEFAULT_COMPOSITE_DIR)
     parser.add_argument("--limit", type=int, default=None, help="Optional max records for quick tests.")
+    parser.add_argument("--resume-from", type=Path, default=None, help="Existing tagged parquet to reuse.")
+    parser.add_argument("--retry-failed", action="store_true", help="Retry rows with vlm_error statuses when resuming.")
     parser.add_argument("--progress-every", type=int, default=25)
     return parser
 
@@ -226,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
     shard_path = resolve_shard_path(args.shard)
     if not shard_path.exists():
         raise FileNotFoundError(f"Missing shard: {shard_path}")
+    existing = pd.read_parquet(args.resume_from) if args.resume_from else None
 
     tagged = caption_frames(
         frames,
@@ -235,6 +357,8 @@ def main(argv: list[str] | None = None) -> int:
         model=args.model,
         model_name=args.model_name,
         limit=args.limit,
+        existing=existing,
+        retry_failed=args.retry_failed,
         progress_every=args.progress_every,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)

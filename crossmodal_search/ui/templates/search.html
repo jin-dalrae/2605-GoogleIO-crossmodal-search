@@ -16,7 +16,7 @@
       </form>
       <div id="status-line" class="status-line">
         {% if status.ready %}
-          {{ status.row_count }} indexed frames
+          {{ status.visual_indexed_frames }} visual frames indexed
         {% else %}
           Index unavailable: {{ status.error }}
         {% endif %}

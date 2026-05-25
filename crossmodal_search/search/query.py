@@ -156,6 +156,10 @@ def metadata_only_unsupported_terms(query: str) -> list[str]:
     return list(dict.fromkeys(combined))
 
 
+def visual_query_terms(query: str) -> list[str]:
+    return metadata_only_unsupported_terms(query)
+
+
 def query_vector(text: str, n_features: int = VECTOR_FEATURES) -> np.ndarray:
     vec = vectorizer().transform([text])
     return vec.astype(np.float32).toarray()[0]
@@ -172,6 +176,17 @@ def infer_filters(query: str) -> dict[str, str]:
         if any(_has_term(lowered, term) for term in terms):
             filters["motion_state"] = motion_state
             break
+    return filters
+
+
+def _filter_from_route(route: dict[str, Any]) -> dict[str, str]:
+    filters = {}
+    intent_name = route.get("intent_name")
+    motion_state = route.get("motion_state")
+    if intent_name and intent_name != "UNKNOWN":
+        filters["intent_name"] = str(intent_name)
+    if motion_state:
+        filters["motion_state"] = str(motion_state)
     return filters
 
 
@@ -204,6 +219,20 @@ def lexical_bonus(row: pd.Series, query: str) -> float:
     return min(0.12, hits * 0.025)
 
 
+def row_haystack(row: pd.Series) -> str:
+    return " ".join(
+        [
+            str(row.get("search_text", "")),
+            tags_to_text(row.get("tags")),
+            str(row.get("caption", "")),
+            str(row.get("road_type", "")),
+            str(row.get("weather", "")),
+            str(row.get("time_of_day", "")),
+            str(row.get("agents_json", "")),
+        ]
+    ).lower()
+
+
 @dataclass
 class CrossmodalIndex:
     frames: pd.DataFrame
@@ -231,9 +260,82 @@ class CrossmodalIndex:
         return bool((self.frames["caption_status"] == "vlm").any())
 
     def blocking_query_terms(self, query: str) -> list[str]:
+        terms = metadata_only_unsupported_terms(query)
         if self.visual_search_available():
             return []
-        return metadata_only_unsupported_terms(query)
+        return terms
+
+    def route_query(self, query: str, *, use_managed_agent: bool = True) -> dict[str, Any]:
+        route = {
+            "query": query,
+            "normalized_query": query,
+            "filters": infer_filters(query),
+            "blocked_terms": self.blocking_query_terms(query),
+            "agent": {
+                "enabled": False,
+                "provider": "local",
+                "name": "deterministic_router",
+                "model": None,
+                "reason": None,
+            },
+        }
+        if not use_managed_agent:
+            return route
+
+        try:
+            from crossmodal_search.agents.managed import QueryRouterAgent, managed_agent_status
+
+            status = managed_agent_status()
+            if not status.available:
+                route["agent"] = {
+                    "enabled": False,
+                    "provider": status.provider,
+                    "name": "query_router",
+                    "model": status.model,
+                    "reason": status.reason,
+                }
+                return route
+
+            managed_route = QueryRouterAgent(status.model or "").route(
+                query,
+                visual_search_available=self.visual_search_available(),
+            )
+            filters = _filter_from_route(managed_route)
+            blocked_terms = []
+            if managed_route.get("requires_visual_index") and not self.visual_search_available():
+                blocked_terms = [str(term) for term in managed_route.get("unsupported_terms", [])]
+            route.update(
+                {
+                    "normalized_query": managed_route.get("normalized_query") or query,
+                    "filters": filters,
+                    "blocked_terms": blocked_terms,
+                    "agent": {
+                        "enabled": True,
+                        "provider": managed_route.get("provider"),
+                        "name": managed_route.get("agent"),
+                        "model": managed_route.get("model"),
+                        "reason": managed_route.get("explanation"),
+                    },
+                }
+            )
+        except Exception as exc:
+            try:
+                from crossmodal_search.agents.managed import managed_agent_status
+
+                status = managed_agent_status()
+                provider = status.provider
+                model = status.model
+            except Exception:
+                provider = "managed_agent"
+                model = None
+            route["agent"] = {
+                "enabled": False,
+                "provider": provider,
+                "name": "query_router",
+                "model": model,
+                "reason": f"managed agent failed; used local router: {exc.__class__.__name__}",
+            }
+        return route
 
     def frame_row(self, frame_name: str) -> pd.Series:
         matches = self.frames[self.frames["frame_name"] == frame_name]
@@ -251,27 +353,62 @@ class CrossmodalIndex:
             na_position="last",
         )
 
-    def search(self, query: str, *, k: int = 12, candidate_k: int = 80) -> list[dict[str, Any]]:
+    def search(
+        self,
+        query: str,
+        *,
+        k: int = 12,
+        candidate_k: int = 80,
+        filters: dict[str, str] | None = None,
+        enforce_blocking: bool = True,
+    ) -> list[dict[str, Any]]:
         if self.frames.empty:
             return []
-        if self.blocking_query_terms(query):
+        if enforce_blocking and self.blocking_query_terms(query):
             return []
 
+        visual_terms = visual_query_terms(query)
+        frame_indexes = np.arange(len(self.frames))
+        if self.visual_search_available():
+            vlm_mask = self.frames.get("caption_status", pd.Series([], dtype=str)).eq("vlm").to_numpy()
+            frame_indexes = np.flatnonzero(vlm_mask)
+            if len(frame_indexes) == 0:
+                return []
+        if visual_terms:
+            lexical_mask = []
+            for index in frame_indexes:
+                haystack = row_haystack(self.frames.iloc[int(index)])
+                lexical_mask.append(any(_has_term(haystack, term) for term in visual_terms))
+            frame_indexes = frame_indexes[np.array(lexical_mask, dtype=bool)]
+            if len(frame_indexes) == 0:
+                return []
+
         qvec = query_vector(query, self.manifest.get("vectorizer", {}).get("n_features", VECTOR_FEATURES))
-        scores = np.einsum("ij,j->i", self.vectors, qvec)
+        scores = np.einsum("ij,j->i", self.vectors[frame_indexes], qvec)
         scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
         if not query.strip():
-            scores = np.linspace(1.0, 0.0, len(self.frames), dtype=np.float32)
+            scores = np.linspace(1.0, 0.0, len(frame_indexes), dtype=np.float32)
 
-        filters = infer_filters(query)
-        candidate_count = min(max(candidate_k, k * 4), len(self.frames))
-        candidate_indexes = np.argpartition(-scores, candidate_count - 1)[:candidate_count]
+        filters = filters if filters is not None else infer_filters(query)
+        if filters:
+            keep = []
+            for index in frame_indexes:
+                row = self.frames.iloc[int(index)]
+                keep.append(all(str(row.get(column, "") or "") == expected for column, expected in filters.items()))
+            frame_indexes = frame_indexes[np.array(keep, dtype=bool)]
+            if len(frame_indexes) == 0:
+                return []
+            scores = np.einsum("ij,j->i", self.vectors[frame_indexes], qvec)
+            scores = np.nan_to_num(scores, nan=0.0, posinf=0.0, neginf=0.0)
+        candidate_count = min(max(candidate_k, k * 4), len(frame_indexes))
+        candidate_positions = np.argpartition(-scores, candidate_count - 1)[:candidate_count]
 
         ranked_rows = []
-        for index in candidate_indexes:
-            row = self.frames.iloc[int(index)]
-            final_score = float(scores[index]) + filter_bonus(row, filters) + lexical_bonus(row, query)
-            ranked_rows.append((final_score, int(index), row))
+        for position in candidate_positions:
+            index = int(frame_indexes[int(position)])
+            row = self.frames.iloc[index]
+            final_score = float(scores[int(position)]) + filter_bonus(row, filters) + lexical_bonus(row, query)
+            ranked_rows.append((final_score, index, row))
         ranked_rows.sort(key=lambda item: item[0], reverse=True)
 
         per_segment_hits: dict[str, int] = {}
@@ -362,12 +499,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     index = CrossmodalIndex.load(args.manifest)
-    blocked = index.blocking_query_terms(args.query)
+    route = index.route_query(args.query)
+    blocked = route["blocked_terms"]
     if blocked:
         terms = ", ".join(blocked)
         print(f"visual search unavailable for: {terms}")
         return 0
-    for result in index.search(args.query, k=args.k):
+    agent = route["agent"]
+    if agent["enabled"]:
+        print(f"managed agent: {agent['provider']} / {agent['model']} ({agent['reason']})")
+    for result in index.search(
+        route["normalized_query"],
+        k=args.k,
+        filters=route["filters"],
+        enforce_blocking=False,
+    ):
         print(
             f"{result['score']:.3f} {result['frame_name']} "
             f"{result['intent_name']} frame {result['frame_display']} of {result['segment_frame_count']} "

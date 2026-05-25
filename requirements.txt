@@ -1,9 +1,10 @@
 Flask
 google-crc32c
 numpy
+openai
 pandas
 Pillow
 protobuf
 pyarrow
+requests
 scikit-learn
-

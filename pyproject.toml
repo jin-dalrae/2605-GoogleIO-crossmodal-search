@@ -9,8 +9,10 @@ dependencies = [
   "numpy",
   "pandas",
   "Pillow",
+  "openai",
   "protobuf",
   "pyarrow",
+  "requests",
   "scikit-learn",
 ]
 

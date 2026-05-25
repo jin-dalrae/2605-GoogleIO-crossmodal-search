@@ -42,17 +42,22 @@ def load_index() -> CrossmodalIndex:
 def index_status() -> dict[str, object]:
     try:
         index = load_index()
+        visual_frames = int(index.frames["caption_status"].eq("vlm").sum()) if "caption_status" in index.frames else 0
         return {
             "ready": True,
             "row_count": len(index.frames),
+            "visual_indexed_frames": visual_frames,
             "manifest": str(DEFAULT_MANIFEST),
+            "visual_search_available": index.visual_search_available(),
             "error": None,
         }
     except Exception:
         return {
             "ready": False,
             "row_count": 0,
+            "visual_indexed_frames": 0,
             "manifest": str(DEFAULT_MANIFEST),
+            "visual_search_available": False,
             "error": LOAD_ERROR,
         }
 
@@ -89,7 +94,8 @@ def api_search():
         abort(503)
     query = request.args.get("q", "")
     k = min(max(request.args.get("k", default=12, type=int), 1), 40)
-    blocked = index.blocking_query_terms(query)
+    route = index.route_query(query)
+    blocked = route["blocked_terms"]
     warnings = []
     if blocked:
         warnings.append(
@@ -97,13 +103,20 @@ def api_search():
         )
         results = []
     else:
-        results = index.search(query, k=k)
+        results = index.search(
+            route["normalized_query"],
+            k=k,
+            filters=route["filters"],
+            enforce_blocking=False,
+        )
     return jsonify(
         {
             "query": query,
+            "normalized_query": route["normalized_query"],
             "results": results,
             "warnings": warnings,
             "mode": "visual" if index.visual_search_available() else "metadata_only",
+            "agent": route["agent"],
             "camera_order": CAMERA_DISPLAY_ORDER,
         }
     )
