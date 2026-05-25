@@ -1,340 +1,231 @@
 # Crossmodal Search
 
-Natural-language search over the Waymo End-to-End Camera dataset.
+Natural-language search over local Waymo End-to-End Camera TFRecord shards.
 
-Type `"left turn at an intersection with a cyclist, dusk"` → get back ranked
-moments, each showing all 8 synchronized camera views + ego intent + past
-trajectory.
+This repo is an MVP for indexing a local shard, captioning synchronized
+8-camera frames, embedding the grounded text, and serving a search UI with a
+cockpit detail page. It is not a canned demo: search results come from the
+local generated index under `crossmodal_search/data/`, which is intentionally
+gitignored.
 
-Status: MVP vertical slice built for one local shard. The local data products
-are generated under `crossmodal_search/data/` and are gitignored.
+## Current State
 
-## Why this exists
+As of 2026-05-25, the implementation supports the full local path:
 
-Waymo publishes thousands of TFRecord shards. To answer the question *"show me
-a moment where the car turns left and there is a cyclist"* you currently have
-to download terabytes and scan TFRecords by hand. There is no index, no search,
-no metadata table — just blobs in a bucket. Every researcher who touches this
-data ends up writing their own "scan 2000 shards" loop. We are writing the
-thing they all wished existed.
+- scan one local E2E TFRecord shard into `frames.parquet`
+- hydrate frame images from byte offsets
+- build 4x2 camera mosaics
+- call a managed vision captioning agent
+- embed captions/tags into a local vector index
+- serve a Flask search UI and frame detail page
 
-## Scope (deliberate narrowing)
-
-Waymo ships three datasets in three buckets with three ID schemes that do not
-cleanly join:
-
-- **Motion** (`Scenario` proto) — tracks, agents, map features
-- **End-to-End Camera** (`E2EDFrame`) — 8 cameras + ego state + intent
-- **Perception** — LiDAR + 3D boxes
-
-We are doing **E2E only**. The hard "join Motion ↔ E2E" problem (different
-IDs, different time bases, ambiguous matching) is deferred. The E2E dataset
-is already self-contained and rich enough to support magical NL queries.
-
-## Unit of data
-
-One **frame** = one TFRecord record in an E2E shard:
+The active local index in this workspace is still small: 20 sampled rows, with
+1 real VLM-captioned frame and 19 provider failures. The real visual frame is:
 
 ```text
-frame = {
-  frame_name:    "<segment_id>-<frame_index>"   # e.g. e0ae38e2…-142
-  segment_id:    string                          # groups frames into a drive
-  frame_index:   int                             # ordering inside segment
-  intent:        GO_STRAIGHT | GO_LEFT | GO_RIGHT | UNKNOWN
-  past_states:   16 steps × {pos_xyz, vel_xy, accel_xy}
-  images:        { FRONT, FRONT_LEFT, FRONT_RIGHT, SIDE_LEFT, SIDE_RIGHT,
-                   REAR, REAR_LEFT, REAR_RIGHT }   # 8 JPEGs
-  shard_object:  string   # GCS object name
-  byte_offset:   int      # where the record starts in the shard
-  byte_length:   int      # record payload length
-}
+e0ae38e2d9675d9d889eaffcf10fe392-142
+intent: GO_RIGHT
+caption: A vehicle navigating an urban environment with signs of road
+construction and multiple intersections, transitioning towards a curved road
+section marked by retaining walls and chevron signs, under clear daytime
+conditions.
 ```
 
-A **segment** is a contiguous drive — frames from one segment are written
-sequentially and almost certainly live in a single shard (verify on a few
-segments before relying on this).
+That means visual search currently works only for concepts present in that
+caption/tags. For example, `intersection` can return the real indexed frame.
+`crash` returns no result because no indexed visual caption contains crash
+evidence. The UI reports how many visual frames are indexed and does not show
+placeholder rows as visual search hits.
 
-For the E2E test split alone: 266 shards × ~775 records ≈ **~206K frames**.
+## Managed Agents
 
-## Architecture
+The project uses managed agents when provider keys are available in `.env` or
+the process environment.
 
-```
-                ┌──────────────────────────────────────────┐
-                │             GCS Bucket                    │
-                │  waymo_open_dataset_end_to_end_camera…    │
-                │  test_*.tfrecord-*-of-00266  (×266)       │
-                └──────────────┬───────────────────────────┘
-                               │ HTTP range reads
-                ┌──────────────▼───────────────────────────┐
-                │  Stage 1: Structural Scan                │
-                │  - Walk every record header              │
-                │  - Extract frame_name, intent, past      │
-                │  - Record shard_object + byte_offset     │
-                │  → frames.parquet  (~206K rows, ~50 MB)  │
-                └──────────────┬───────────────────────────┘
-                               │ for each frame, fetch 8 JPEGs
-                ┌──────────────▼───────────────────────────┐
-                │  Stage 2: Visual Tagging                 │
-                │  - Composite 8 views into one image      │
-                │  - VLM pass: caption + structured tags   │
-                │    (weather, time-of-day, road type,     │
-                │     agents present, traffic-light)       │
-                │  → frames_tagged.parquet                 │
-                └──────────────┬───────────────────────────┘
-                               │
-                ┌──────────────▼───────────────────────────┐
-                │  Stage 3: Embedding                      │
-                │  - Embed caption + structured-tag bag    │
-                │  - Optional: CLIP image embedding        │
-                │  → vector index (LanceDB / FAISS)         │
-                └──────────────┬───────────────────────────┘
-                               │
-                ┌──────────────▼───────────────────────────┐
-                │  Query API                                │
-                │  NL query → embedding                     │
-                │  + structured WHERE (intent='GO_LEFT')    │
-                │  → top-K frame_names                       │
-                └──────────────┬───────────────────────────┘
-                               │
-                ┌──────────────▼───────────────────────────┐
-                │  Viewer                                   │
-                │  - Result grid: 8 camera views per hit    │
-                │  - Ego intent + trajectory overlay        │
-                │  - Click → full segment scrubber          │
-                └───────────────────────────────────────────┘
-```
+- `QueryRouterAgent` routes user queries into supported filters and visual
+  requirements. It prevents unsupported visual terms from being treated as
+  indexed facts.
+- `VisionCaptionAgent` captions a 4x2 mosaic of the 8 synchronized cameras and
+  emits a caption plus structured tags.
 
-## Index schema (`frames.parquet`)
+Provider selection is automatic by default:
 
-| column | type | source |
-|---|---|---|
-| `frame_name` | string | E2EDFrame.frame.context.name (field 1.1.1) |
-| `segment_id` | string | split `frame_name` on last `-` |
-| `frame_index` | int | suffix of `frame_name` |
-| `intent` | enum | E2EDFrame.intent (field 7) |
-| `past_pos_x` | float[16] | E2EDFrame.past_states (field 6.1) |
-| `past_pos_y` | float[16] | field 6.2 |
-| `past_vel_x` | float[16] | field 6.4 |
-| `past_vel_y` | float[16] | field 6.5 |
-| `past_speed_mean` | float | derived: mean(‖vel‖) |
-| `past_yaw_change` | float | derived: heading delta over window |
-| `shard_object` | string | GCS object name |
-| `byte_offset` | int | record start in shard |
-| `byte_length` | int | record payload length |
-| `caption` | string | Stage 2 output |
-| `tags` | string[] | Stage 2 output (structured) |
-| `text_embedding` | float[768] | Stage 3 |
-| `image_embedding` | float[512] | Stage 3, optional |
+- Gemini: `GEMINI_API_KEY`, default model `gemini-2.5-flash`
+- OpenAI: `OPENAI_API_KEY`, default model `gpt-5-mini`
+- Override provider: `CROSSMODAL_AGENT_PROVIDER=gemini|openai|auto`
+- Disable hosted agents: `CROSSMODAL_MANAGED_AGENTS=0`
 
-## Stage 2: tagging prompts
+Lowercase aliases such as `gemini_api_key` and `openai_api_key` are also
+accepted. `.env` can live at the repo root or inside `crossmodal_search/`.
+Never commit `.env`.
 
-One pass per frame, given a 4×2 grid composite of the 8 views:
+Known provider blockers:
 
-```
-Describe this driving scene. Return JSON with:
-- one_line_caption: a single sentence
-- time_of_day: day | dusk | dawn | night | unknown
-- weather: clear | rain | snow | fog | wet_road | unknown
-- road_type: highway | urban_street | intersection | residential | parking_lot | other
-- traffic_lights_visible: bool
-- agents: list of {type: vehicle|pedestrian|cyclist|truck|bus, count: int}
-- notable: list of free-text tokens for unusual things
-```
+- Gemini captioning has produced HTTP/API failures during batch captioning,
+  including an invalid-key response in one retry.
+- OpenAI routing/captioning has hit account rate limits in this environment.
 
-Structured tags become indexable columns (`time_of_day='dusk' AND
-agents.cyclist > 0`). Captions go to the text embedding.
+Until provider reliability is fixed, the product should be presented as a
+working local MVP with a partial visual index, not as a complete dataset-wide
+visual search engine.
 
-## Cost model (one-time, 206K frames)
+## Search Behavior
 
-| stage | per-frame | total |
-|---|---|---|
-| Stage 1 scan (HTTP range, no captioning) | ~1 s, parallelized | ~10 min @ 32 workers |
-| Stage 2 captioning with Claude Haiku | ~$0.003 | **~$600** |
-| Stage 2 captioning with local BLIP-2 / LLaVA | GPU time only | $50–100 |
-| Stage 3 text embedding | ~$0.0001 | ~$20 |
-| Storage | — | <1 GB |
+Search is intentionally strict:
 
-Captioning dominates. Open-model captioning is the right MVP path; upgrade to
-Claude Haiku later if recall isn't good enough.
+- visual queries search only rows with `caption_status == "vlm"`
+- visual terms must appear in the grounded caption, tags, or structured fields
+- intent and motion terms are hard filters, not score boosts
+- results are deduplicated by segment
+- a query such as `left turn` cannot return a `GO_RIGHT` frame
+- a query such as `crash` returns no results unless a real VLM-captioned row
+  contains crash evidence
 
-## Query path
+The fallback structural rows still help with development and ego-motion
+commands, but they are not surfaced as visual evidence.
 
-```
-user query
-    │
-    ▼
-[router] ──► structured? (regex / LLM classifier)
-    │           │
-    │           ├─► "left turns at intersections with cyclists"
-    │           │      → WHERE intent='GO_LEFT'
-    │           │        AND tags @> '{intersection}'
-    │           │        AND agents.cyclist > 0
-    │           │
-    │           └─► semantic-only? skip filters
-    │
-    ▼
-[embed]  query → text_embedding
-    │
-    ▼
-[search] vector_search(text_embedding, k=50) WHERE <filters>
-    │
-    ▼
-[rerank]  optional: cross-encoder rerank top-50 → top-10
-    │
-    ▼
-[hydrate] for each hit: fetch the 8 JPEGs via HTTP range
-          using (shard_object, byte_offset, byte_length)
-    │
-    ▼
-[viewer]  show 8-camera grid + ego trajectory + segment context
-```
+## Setup
 
-## UI
-
-Two screens. Single-page app.
-
-### Screen 1 — search + results grid
-
-Top: one big search bar. Below: a grid of result cards. Each card is a
-**4×2 mosaic** of the 8 cameras (FRONT_LEFT, FRONT, FRONT_RIGHT, SIDE_LEFT
-on row 1; SIDE_RIGHT, REAR_RIGHT, REAR, REAR_LEFT on row 2 — same order
-as `e2e_viewer/`), with a caption and chips underneath.
-
-```text
-┌────────────────────────────────────────────────────────────────────┐
-│  🔍  left turn at intersection with cyclist                        │
-└────────────────────────────────────────────────────────────────────┘
-
-  ┌────────────────────────┐   ┌────────────────────────┐
-  │ ┌──┬──┬──┬──┐          │   │ ┌──┬──┬──┬──┐          │
-  │ │FL│FR│FR│SL│          │   │ │FL│FR│FR│SL│          │
-  │ ├──┼──┼──┼──┤          │   │ ├──┼──┼──┼──┤          │
-  │ │SR│RR│R │RL│          │   │ │SR│RR│R │RL│          │
-  │ └──┴──┴──┴──┘          │   │ └──┴──┴──┴──┘          │
-  ├────────────────────────┤   ├────────────────────────┤
-  │ Left turn at busy      │   │ Left turn, dusk,       │
-  │ intersection, dusk.    │   │ cyclist at crosswalk.  │
-  │ ▸ GO_LEFT ▸ dusk       │   │ ▸ GO_LEFT ▸ cyclist    │
-  │ segment e0ae38e2…      │   │ segment 1b0a4771…      │
-  │ frame 142 / 287        │   │ frame  88 / 312        │
-  └────────────────────────┘   └────────────────────────┘
-        click anywhere → detail view
-```
-
-**Result grouping**: one card per *segment*, not per *frame*. When 20
-consecutive frames from one drive all match the query, we pick the
-best-matching frame as the thumbnail and show "frame 142 of 287" so the
-user knows there's more to scrub. Reason: 20 near-identical cards is
-noise; one card with "20 frames matched here" is signal.
-
-### Screen 2 — frame detail (cockpit layout)
-
-Clicking a card opens the frame in a **cockpit-layout** detail view —
-the 8 cameras arranged in their spatial position around an imaginary
-car, with a metadata sidebar on the right and a segment scrubber along
-the bottom.
-
-```text
-┌──── ← back to results ──────────────────────────────────────────────┐
-│                                                                      │
-│  ┌────────┐ ┌──────────────┐ ┌────────┐  │ INTENT                   │
-│  │ FRONT  │ │    FRONT     │ │ FRONT  │  │ GO_LEFT                  │
-│  │ LEFT   │ │              │ │ RIGHT  │  │                          │
-│  └────────┘ └──────────────┘ └────────┘  │ CAPTION                  │
-│                                          │ Left turn at a busy      │
-│  ┌────────┐                  ┌────────┐  │ intersection at dusk.    │
-│  │ SIDE   │                  │ SIDE   │  │ A cyclist crosses        │
-│  │ LEFT   │                  │ RIGHT  │  │ the crosswalk.           │
-│  └────────┘                  └────────┘  │                          │
-│                                          │ TAGS                     │
-│  ┌────────┐ ┌──────────────┐ ┌────────┐  │ dusk · urban · cyclist   │
-│  │ REAR   │ │    REAR      │ │ REAR   │  │ · intersection           │
-│  │ LEFT   │ │              │ │ RIGHT  │  │                          │
-│  └────────┘ └──────────────┘ └────────┘  │ EGO STATE                │
-│                                          │ vel: 3.2 m/s             │
-│                                          │ speed ▁▂▃▅▆▇▆▅▃▂         │
-├──────────────────────────────────────────┴──────────────────────────┤
-│  ◀  ━━━━━━━●━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ▶  frame 142/287 │
-│            segment scrubber                                           │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-The scrubber loads adjacent frames in the same segment so you can see
-what happens immediately before and after the moment that matched.
-
-Click on any individual camera in the cockpit grid → fullscreen that
-camera (keyboard `esc` or click again to dismiss).
-
-## MVP scope (the smallest thing worth shipping)
-
-1. **Index one shard.** ~775 frames from
-   `test_202504211836-202504220845.tfrecord-00004-of-00266` (already
-   local). Validate the scan + parse + parquet pipeline end-to-end.
-2. **Caption with a local model.** BLIP-2 or LLaVA-Next. ~775 calls.
-   Tag every frame with structured fields too.
-3. **Text-only embedding + cosine search.** No image embeddings yet.
-4. **Minimal Flask UI** — exactly the two screens above:
-   - search bar + 4×2-mosaic results grid (segment-deduped)
-   - cockpit detail view with sidebar + scrubber
-5. **Read JPEGs from the local shard via byte offsets** (no GCS in MVP).
-
-Ship that against 775 frames. Then scale: index all 266 test shards,
-swap local-shard reads for GCS range reads, add image embeddings, add
-structured filter UI (intent dropdown, time-of-day toggles).
-
-## Open questions
-
-- **Is one segment always in one shard?** Need to verify on 3–5 known
-  segments. If true, segment-level retrieval is free; if not, we need
-  segment-spanning logic.
-- **Composite vs per-camera captioning?** A 4×2 grid loses resolution but is
-  4× cheaper. Front camera alone may capture 80% of the query-relevant signal.
-- **Open-model caption quality at night / rain?** Likely worst case. May need
-  Haiku fallback for low-confidence Stage 2 outputs.
-- **Segment grouping on retrieval.** When 20 frames from the same segment
-  all match, do we show 20 results or one segment with 20 hits? Probably the
-  latter — dedupe to segment-level then expand on click.
-- **Should we run Stage 1 in Google Cloud (same region as bucket)?** Egress
-  savings + much faster range reads. Probably yes for the full 206K pass.
-
-## Layout (proposed)
-
-```
-crossmodal_search/
-  README.md            ← this file
-  indexer/
-    scan.py            ← Stage 1: walk shards, write frames.parquet
-    caption.py         ← Stage 2: VLM tagging
-    embed.py           ← Stage 3: text + image embeddings
-  search/
-    query.py           ← NL query → top-K
-    hydrate.py         ← fetch JPEGs by (shard, offset, length)
-  ui/
-    app.py             ← Flask: search box + result grid
-    templates/
-  data/
-    frames.parquet     ← committed? no — too big. write to .gitignore.
-    vectors.lance/     ← LanceDB on-disk index
-```
-
-## Next step
-
-Run or refresh the one-shard MVP:
+Use Python 3.11 or newer.
 
 ```bash
-python3 -m crossmodal_search.indexer.scan
-python3 -m crossmodal_search.indexer.caption --model heuristic
+cd /Users/dalrae/Downloads/Developed/crossmodal_search
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+```
+
+Add provider keys if you want managed routing or managed captioning:
+
+```bash
+cat > .env <<'EOF'
+GEMINI_API_KEY=...
+# OPENAI_API_KEY=...
+CROSSMODAL_AGENT_PROVIDER=auto
+EOF
+```
+
+The default shard path is the repo root:
+
+```text
+test_202504211836-202504220845.tfrecord-00004-of-00266
+```
+
+You can also pass any local shard with `--shard /path/to/shard`.
+
+## Build A Local Index
+
+Scan the local shard:
+
+```bash
+python3 -m crossmodal_search.indexer.scan \
+  --shard /path/to/test_202504211836-202504220845.tfrecord-00004-of-00266 \
+  --progress-every 100
+```
+
+Caption a small batch with the managed vision agent:
+
+```bash
+python3 -m crossmodal_search.indexer.caption \
+  --model managed \
+  --limit 20 \
+  --progress-every 1 \
+  --shard /path/to/test_202504211836-202504220845.tfrecord-00004-of-00266
+```
+
+Resume and retry failed VLM rows:
+
+```bash
+python3 -m crossmodal_search.indexer.caption \
+  --model managed \
+  --resume-from crossmodal_search/data/frames_tagged.parquet \
+  --retry-failed \
+  --limit 20 \
+  --progress-every 1 \
+  --shard /path/to/test_202504211836-202504220845.tfrecord-00004-of-00266
+```
+
+Build the local vector index:
+
+```bash
 python3 -m crossmodal_search.indexer.embed
+```
+
+Run the web UI:
+
+```bash
 python3 -m crossmodal_search.ui.app
 ```
 
-Open `http://127.0.0.1:5003`.
+Open:
 
-The captioner has an optional BLIP path (`--model auto` or `--model blip`),
-but this workspace currently falls back to metadata-only placeholders unless
-the local `transformers` install is repaired and the model is already cached.
-In metadata-only mode, only ego metadata queries such as `left turn`,
-`right turn`, `straight`, `stopped`, `slow`, or `moving` are accepted. Visual
-queries such as `cyclist`, `intersection`, `night`, `rain`, `traffic light`,
-or arbitrary scene text intentionally return no results instead of fabricated
-matches.
+```text
+http://127.0.0.1:5003
+```
+
+## Useful Checks
+
+Inspect local index status:
+
+```bash
+python3 -c "import pandas as pd; df=pd.read_parquet('crossmodal_search/data/frames_embedded.parquet'); print(len(df)); print(df['caption_status'].value_counts(dropna=False))"
+```
+
+Try the CLI search path:
+
+```bash
+python3 -m crossmodal_search.search.query "intersection"
+python3 -m crossmodal_search.search.query "crash"
+python3 -m crossmodal_search.search.query "left turn"
+```
+
+Expected behavior with the current partial local index:
+
+- `intersection` can return the one real VLM-captioned frame
+- `crash` returns no result
+- `left turn` returns no result if there is no `GO_LEFT` VLM row
+
+## Data Products
+
+Generated files live under `crossmodal_search/data/` and are ignored by git.
+
+- `frames.parquet`: scanned shard metadata, frame names, byte offsets, ego
+  intent, and past state summaries
+- `frames_tagged.parquet`: captions, tags, structured fields, caption status,
+  and optional composite paths
+- `frames_embedded.parquet`: tagged rows plus `search_text`
+- `text_vectors.npy`: local HashingVectorizer vectors
+- `search_index.json`: manifest consumed by the CLI and Flask app
+- `composites/`: optional 4x2 camera mosaic JPEG cache
+
+## UI
+
+The UI has two screens:
+
+- `/`: search bar plus result cards, each using a 4x2 mosaic in the Waymo
+  camera order
+- `/frame/<frame_name>`: cockpit detail page with camera sidebar, frame
+  metadata, and segment scrubber
+
+Image payloads are hydrated from the local shard using `shard_path`,
+`byte_offset`, and `byte_length`.
+
+## Roadmap
+
+Immediate work:
+
+- fix provider/key reliability so the managed captioner can complete a full
+  shard batch
+- index all frames in one shard with real VLM captions
+- add an eval set for "must return" and "must not return" queries
+- replace the current hashing-vectorizer backend when the caption corpus is
+  large enough to justify a stronger embedding store
+- create a demo video only from the real active index after visual coverage is
+  broad enough
+
+Deferred work:
+
+- GCS range reads instead of local-only shard access
+- all 266 test shards
+- Motion/E2E joins
+- image embeddings or CLIP-style retrieval
